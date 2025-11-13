@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -15,18 +17,133 @@ import (
 
 	"slices"
 
-	"github.com/c12s/hyparview/data"
-	"github.com/c12s/hyparview/hyparview"
-	"github.com/c12s/hyparview/transport"
-	"github.com/caarlos0/env"
+	"github.com/tamararankovic/extrema_propagation/config"
+	"github.com/tamararankovic/extrema_propagation/peers"
 )
 
-const AGG_MSG_TYPE data.MessageType = data.UNKNOWN + 1
+const AGG_MSG_TYPE int8 = 1
 
-type Msg struct {
+const (
+	EXP_BITS = 5
+	EXP_MASK = (1 << EXP_BITS) - 1 // 0b11111 = 31
+)
+
+func encodeValue(v float64) uint8 {
+	if v <= 0 {
+		return 0
+	}
+	exp := int(math.Floor(math.Log2(v)))
+	if exp < -28 {
+		exp = -28
+	}
+	if exp > 3 {
+		exp = 3
+	}
+	return uint8(exp + 28) // shift into range 0..31
+}
+
+func decodeValue(e uint8) float64 {
+	exp := int(e) - 28
+	return math.Pow(2, float64(exp))
+}
+
+type Msg interface {
+	Type() int8
+}
+
+type EPMsg struct {
 	Epoch       int
 	ValuesSum   []float64
 	ValuesCount []float64
+}
+
+func (m EPMsg) Type() int8 {
+	return AGG_MSG_TYPE
+}
+
+func EncodeEPMsg(m *EPMsg) []byte {
+	K := len(m.ValuesSum)
+	totalBits := 8 + 32 + 16 + (K * EXP_BITS * 2)
+	out := make([]byte, (totalBits+7)/8)
+
+	// Write type
+	out[0] = byte(AGG_MSG_TYPE)
+	bitPos := 8
+
+	// Epoch (uint32)
+	binary.LittleEndian.PutUint32(out[1:], uint32(m.Epoch))
+	bitPos += 32
+
+	// K (uint16)
+	binary.LittleEndian.PutUint16(out[5:], uint16(K))
+	bitPos += 16
+
+	// Encode values
+	write5Bits := func(val uint8) {
+		bytePos := bitPos / 8
+		bitOff := bitPos % 8
+
+		out[bytePos] |= val << bitOff
+		if bitOff > 3 {
+			out[bytePos+1] |= val >> (8 - bitOff)
+		}
+		bitPos += EXP_BITS
+	}
+
+	for _, v := range m.ValuesSum {
+		write5Bits(encodeValue(v))
+	}
+	for _, v := range m.ValuesCount {
+		write5Bits(encodeValue(v))
+	}
+
+	return out
+}
+
+func DecodeEPMsg(b []byte) (*EPMsg, error) {
+	if len(b) < 7 {
+		return nil, fmt.Errorf("too short")
+	}
+	if b[0] != byte(AGG_MSG_TYPE) {
+		return nil, fmt.Errorf("type mismatch")
+	}
+
+	epoch := binary.LittleEndian.Uint32(b[1:])
+	K := int(binary.LittleEndian.Uint16(b[5:]))
+
+	totalBitsNeeded := 8 + 32 + 16 + (K * EXP_BITS * 2)
+	if len(b)*8 < totalBitsNeeded {
+		return nil, fmt.Errorf("truncated packet")
+	}
+
+	msg := &EPMsg{
+		Epoch:       int(epoch),
+		ValuesSum:   make([]float64, K),
+		ValuesCount: make([]float64, K),
+	}
+
+	bitPos := 8 + 32 + 16
+
+	read5Bits := func() uint8 {
+		bytePos := bitPos / 8
+		bitOff := bitPos % 8
+		bitPos += EXP_BITS
+
+		val := (b[bytePos] >> bitOff) & EXP_MASK
+		if bitOff > 3 {
+			val |= (b[bytePos+1] << (8 - bitOff)) & EXP_MASK
+		}
+		return val
+	}
+
+	for i := 0; i < K; i++ {
+		msg.ValuesSum[i] = decodeValue(read5Bits())
+	}
+	for i := 0; i < K; i++ {
+		msg.ValuesCount[i] = decodeValue(read5Bits())
+	}
+
+	return msg, nil
 }
 
 type Node struct {
@@ -42,12 +159,11 @@ type Node struct {
 	Epoch       int
 	Round       int
 	EpochLength int
-	Hyparview   *hyparview.HyParView
+	Peers       *peers.Peers
 	Lock        *sync.Mutex
-	Logger      *log.Logger
 }
 
-func (n *Node) receive(msg Msg) {
+func (n *Node) receive(msg *EPMsg) {
 	n.Lock.Lock()
 	defer n.Lock.Unlock()
 
@@ -56,7 +172,7 @@ func (n *Node) receive(msg Msg) {
 	}
 
 	if msg.Epoch > n.Epoch {
-		n.Logger.Printf("[%s] switching to epoch %d", n.ID, msg.Epoch)
+		log.Printf("[%s] switching to epoch %d", n.ID, msg.Epoch)
 		n.Epoch = msg.Epoch
 		n.Round = 0
 		n.resetMinima()
@@ -65,11 +181,11 @@ func (n *Node) receive(msg Msg) {
 	}
 
 	if len(msg.ValuesSum) != n.K {
-		n.Logger.Println("length mismatch", len(msg.ValuesSum))
+		log.Println("length mismatch", len(msg.ValuesSum))
 		return
 	}
 	if len(msg.ValuesCount) != n.K {
-		n.Logger.Println("length mismatch", len(msg.ValuesCount))
+		log.Println("length mismatch", len(msg.ValuesCount))
 		return
 	}
 
@@ -111,34 +227,29 @@ func (n *Node) send() {
 			n.resetMinima()
 			n.NoNews = 0
 			n.Converged = false
-			n.Logger.Printf("[%s] starting epoch %d", n.ID, n.Epoch)
+			log.Printf("[%s] starting epoch %d", n.ID, n.Epoch)
 		}
 
 		estimate := n.estimate()
-		n.Logger.Printf("[%s] epoch=%d estimate=%.3f", n.ID, n.Epoch, estimate)
+		log.Printf("[%s] epoch=%d estimate=%.3f", n.ID, n.Epoch, estimate)
 
 		if n.Converged {
 			n.Lock.Unlock()
 			continue
 		}
 
-		payload := Msg{
+		payload := EPMsg{
 			Epoch:       n.Epoch,
 			ValuesSum:   slices.Clone(n.MinSum),
 			ValuesCount: slices.Clone(n.MinCount),
 		}
 		n.Lock.Unlock()
 
-		hvMsg := data.Message{
-			Type:    AGG_MSG_TYPE,
-			Payload: payload,
-		}
+		msg := EncodeEPMsg(&payload)
 
-		peers := n.Hyparview.GetPeers(1000)
+		peers := n.Peers.GetPeers()
 		for _, peer := range peers {
-			if err := peer.Conn.Send(hvMsg); err != nil {
-				n.Logger.Println(err)
-			}
+			peer.Send(msg)
 		}
 	}
 }
@@ -165,67 +276,61 @@ func (n *Node) estimate() float64 {
 }
 
 func main() {
-	hvConfig := hyparview.Config{}
-	if err := env.Parse(&hvConfig); err != nil {
-		log.Fatal(err)
-	}
+	time.Sleep(10 * time.Second)
 
-	cfg := Config{}
-	if err := env.Parse(&cfg); err != nil {
-		log.Fatal(err)
-	}
+	cfg := config.LoadConfigFromEnv()
+	params := config.LoadParamsFromEnv()
 
-	self := data.Node{
-		ID:            cfg.NodeID,
-		ListenAddress: cfg.ListenAddr,
-	}
-
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)
-
-	gnConnManager := transport.NewConnManager(
-		transport.NewTCPConn,
-		transport.AcceptTcpConnsFn(self.ListenAddress),
-	)
-
-	hv, err := hyparview.NewHyParView(hvConfig, self, gnConnManager, logger)
+	ps, err := peers.NewPeers(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	tAgg, err := strconv.Atoi(cfg.TAgg)
+	val, err := strconv.Atoi(params.ID)
 	if err != nil {
-		logger.Fatal(err)
-	}
-
-	val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
-	if err != nil {
-		logger.Fatal(err)
+		log.Fatal(err)
 	}
 
 	node := &Node{
-		ID:          cfg.NodeID,
+		ID:          params.ID,
 		Value:       float64(val),
-		TAgg:        tAgg,
-		K:           cfg.K,
-		MinSum:      make([]float64, cfg.K),
-		MinCount:    make([]float64, cfg.K),
-		Hyparview:   hv,
+		TAgg:        params.Tagg,
+		K:           params.K,
+		MinSum:      make([]float64, params.K),
+		MinCount:    make([]float64, params.K),
+		Peers:       ps,
 		Lock:        &sync.Mutex{},
-		Logger:      logger,
-		EpochLength: cfg.EpochLength,
-		MinNoNews:   cfg.MinNoNews,
+		EpochLength: params.EpochLength,
+		MinNoNews:   params.MinNoNews,
 	}
 
 	node.resetMinima()
 
-	hv.AddClientMsgHandler(AGG_MSG_TYPE, func(msgBytes []byte, sender hyparview.Peer) {
-		msg := Msg{}
-		if err := transport.Deserialize(msgBytes, &msg); err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
+	lastRcvd := make(map[string]int)
+	round := 0
+
+	// handle messages
+	go func() {
+		for msgRcvd := range ps.Messages {
+			msg, err := DecodeEPMsg(msgRcvd.MsgBytes)
+			if msg == nil || err != nil {
+				continue
+			}
+			node.receive(msg)
 		}
-		node.receive(msg)
-	})
+	}()
+
+	// remove failed peers
+	go func() {
+		for range time.NewTicker(time.Second).C {
+			round++
+			for _, peer := range ps.GetPeers() {
+				if lastRcvd[peer.GetID()]+params.Rmax < round && round > 10 {
+					ps.PeerFailed(peer.GetID())
+				}
+			}
+		}
+	}()
 
 	go func() {
 		for range time.NewTicker(time.Second).C {
@@ -237,24 +342,13 @@ func main() {
 		}
 	}()
 
-	if err := hv.Join(cfg.ContactID, cfg.ContactAddr); err != nil {
-		logger.Fatal(err)
-	}
-
 	go node.send()
 
 	r := http.NewServeMux()
 	r.HandleFunc("POST /metrics", node.setMetricsHandler)
 	log.Println("Metrics server listening")
 
-	go func() {
-		log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
-	}()
-
-	r2 := http.NewServeMux()
-	r2.HandleFunc("GET /state", node.StateHandler)
-	log.Println("State server listening on :5001/state")
-	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r2))
+	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
 }
 
 func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
@@ -274,9 +368,9 @@ func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	val, err := strconv.ParseFloat(valStr, 64)
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	} else {
-		n.Logger.Println("new value", val)
+		log.Println("new value", val)
 		n.Value = val
 	}
 	w.WriteHeader(http.StatusOK)
@@ -286,13 +380,12 @@ var writers map[string]*csv.Writer = map[string]*csv.Writer{}
 
 func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 	name := "value"
-	filename := fmt.Sprintf("/var/log/monoceros/results/%s.csv", name)
-	// defer file.Close()
+	filename := fmt.Sprintf("/var/log/extrema_propagation/%s.csv", name)
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
-			n.Logger.Printf("failed to open/create file: %v", err)
+			log.Printf("failed to open/create file: %v", err)
 			return
 		}
 		writer = csv.NewWriter(file)
@@ -304,18 +397,17 @@ func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 	valStr := strconv.FormatFloat(value, 'f', -1, 64)
 	err := writer.Write([]string{"x", reqTsStr, rcvTsStr, valStr})
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	}
 }
 
 func (n *Node) exportMsgCount() {
-	filename := "/var/log/monoceros/results/msg_count.csv"
-	// defer file.Close()
+	filename := "/var/log/extrema_propagation/msg_count.csv"
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
-			n.Logger.Printf("failed to open/create file: %v", err)
+			log.Printf("failed to open/create file: %v", err)
 			return
 		}
 		writer = csv.NewWriter(file)
@@ -323,16 +415,16 @@ func (n *Node) exportMsgCount() {
 	}
 	defer writer.Flush()
 	tsStr := strconv.Itoa(int(time.Now().UnixNano()))
-	transport.MessagesSentLock.Lock()
-	sent := transport.MessagesSent - transport.MessagesSentSub
-	transport.MessagesSentLock.Unlock()
-	transport.MessagesRcvdLock.Lock()
-	rcvd := transport.MessagesRcvd - transport.MessagesRcvdSub
-	transport.MessagesRcvdLock.Unlock()
+	peers.MessagesSentLock.Lock()
+	sent := peers.MessagesSent
+	peers.MessagesSentLock.Unlock()
+	peers.MessagesRcvdLock.Lock()
+	rcvd := peers.MessagesRcvd
+	peers.MessagesRcvdLock.Unlock()
 	sentStr := strconv.Itoa(sent)
 	rcvdStr := strconv.Itoa(rcvd)
 	err := writer.Write([]string{tsStr, sentStr, rcvdStr})
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	}
 }
