@@ -348,7 +348,7 @@ func main() {
 	r.HandleFunc("POST /metrics", node.setMetricsHandler)
 	log.Println("Metrics server listening")
 
-	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
+	log.Fatal(http.ListenAndServe(cfg.ListenIP+":9200", r))
 }
 
 func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
